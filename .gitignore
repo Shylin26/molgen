@@ -1,0 +1,26 @@
+# Model checkpoints (large files)
+checkpoints/
+*.pt
+*.pth
+
+# Data files
+zinc250k.csv
+zinc_processed.csv
+outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
