@@ -29,19 +29,19 @@ MAX_SEQ_LEN  = 128
 REWARD_HIDDEN  = 256
 REWARD_LAYERS  = 4
 REWARD_EPOCHS  = 10
-REWARD_BATCH   = 32  # Reduced from 64
+REWARD_BATCH   = 32
 REWARD_LR      = 1e-3
 
 # MolT5
 MOLT5_MODEL  = "laituan245/molt5-small"
 MOLT5_EPOCHS = 5
-MOLT5_BATCH  = 8   # Reduced from 16
+MOLT5_BATCH  = 8
 MOLT5_LR     = 3e-4
 GRAD_CLIP    = 1.0
 
-# Generation
+# Generation — FIXED: GEN_BEAMS was 1, now 5
 GEN_N_CANDIDATES = 50
-GEN_BEAMS        = 1
+GEN_BEAMS        = 5
 GEN_TEMPERATURE  = 1.1
 GEN_TOP_P        = 0.95
 
@@ -51,7 +51,7 @@ NODE_DIM   = len(ATOM_TYPES) + 3
 
 from rdkit.Chem import rdchem
 BOND_TYPES = [
-    rdchem.BondType.SINGLE,       # <-- removed stray "bn" here
+    rdchem.BondType.SINGLE,
     rdchem.BondType.DOUBLE,
     rdchem.BondType.TRIPLE,
     rdchem.BondType.AROMATIC,
