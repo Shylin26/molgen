@@ -1,27 +1,25 @@
 """
-api.py — Final Optimized FastAPI backend for MolGen
-Includes Natural Language Parsing + Gibberish Guard
+api.py — FastAPI backend for MolGen
+Run: python3 -m uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
 import os
-import torch
-import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from typing import Optional
 import pandas as pd
 
-# ── Import ML pipeline ────────────────────────────────────────────────────
 from config import OUTPUTS_DIR, DEVICE
 from dataset import make_custom_prompt
 from generate import load_models, generate_molecules, save_results
-from prompt_parser import parse_natural_language  # <--- YOUR NEW FILE
+from prompt_parser import parse_natural_language
+from mol3d import generate_3d_data
 
-# ── App setup ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="MolGen API",
     description="AI Drug Molecule Generation — MolT5 + GNN Reward Model",
-    version="1.2.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -31,68 +29,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load models at startup ────────────────────────────────────────────────
+# Load models ONCE at startup
 print("[api] Loading models at startup...")
 MODEL, TOKENIZER, REWARD = load_models()
 print("[api] Models ready.")
 
-# ── Request / Response schemas ────────────────────────────────────────────
 
-class GenerateRequest(BaseModel):
-    # Optional text prompt for "Natural Language Mode"
-    text_prompt: str = Field(default=None, description="Human text like 'low solubility drug'")
-    
-    # Numeric targets for "Expert Mode" (Defaults used if text_prompt is empty)
-    qed:  float = Field(default=0.80, ge=0.0, le=1.0)
-    logp: float = Field(default=2.50, ge=-5.0, le=10.0)
-    tpsa: float = Field(default=80.0, ge=0.0, le=200.0)
-    mw:   float = Field(default=350.0, ge=100.0, le=600.0)
-    n:    int   = Field(default=5,   ge=1, le=50)
+# ── Schemas ────────────────────────────────────────────────────────────────────
 
-# ── Endpoints ─────────────────────────────────────────────────────────────
+class Constraints(BaseModel):
+    qed:  float = Field(default=0.80, ge=0.0,   le=1.0,   description="Drug-likeness (0-1)")
+    logp: float = Field(default=2.50, ge=-5.0,  le=10.0,  description="Lipophilicity")
+    tpsa: float = Field(default=80.0, ge=0.0,   le=200.0, description="Polar surface area")
+    mw:   float = Field(default=350.0, ge=100.0, le=600.0, description="Molecular weight")
+
+class WebGenerateRequest(BaseModel):
+    prompt: Optional[str] = Field(default=None, description="Plain English prompt")
+    constraints: Constraints
+    n: int = Field(default=10, ge=1, le=50, description="Candidates to generate")
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": DEVICE, "models": "loaded"}
+    """Check if API and models are running."""
+    return {
+        "status" : "ok",
+        "device" : str(DEVICE),
+        "models" : "loaded"
+    }
+
 
 @app.post("/generate")
-def generate(req: GenerateRequest):
+def generate(req: WebGenerateRequest):
+    """
+    Generate drug-like molecules.
+    Expects prompt and constraints object.
+    """
     try:
-        # 1. DECIDE MODE: Natural Language or Numeric Sliders
-        if req.text_prompt:
-            print(f"[api] Natural Language Mode: '{req.text_prompt}'")
-            targets = parse_natural_language(req.text_prompt)
-            
-            # GIBBERISH GUARD: parse_natural_language returns None for "ggg"
+        # Mode 1: Natural language
+        if req.prompt and req.prompt.strip():
+            print(f"[api] Natural language mode: '{req.prompt}'")
+            targets = parse_natural_language(req.prompt)
+
             if targets is None:
                 raise HTTPException(
-                    status_code=400, 
-                    detail="Invalid prompt. Please use chemical terms (e.g., 'small molecule', 'polar')."
+                    status_code=400,
+                    detail="Invalid prompt. Use chemistry terms like 'antiviral', 'small', 'polar', 'brain', 'cancer'."
                 )
-            
-            # Map parsed values to our variables
-            target_qed  = targets['qed']
-            target_logp = targets['logp']
-            target_tpsa = targets['tpsa']
-            target_mw   = targets['mw']
+
+            target_qed  = targets["qed"]
+            target_logp = targets["logp"]
+            target_tpsa = targets["tpsa"]
+            target_mw   = targets["mw"]
+
+        # Mode 2: Use provided constraints directly if no prompt or prompt parsing failed
         else:
-            # Expert Mode: Use slider values directly
-            target_qed  = req.qed
-            target_logp = req.logp
-            target_tpsa = req.tpsa
-            target_mw   = req.mw
+            print(f"[api] Using constraints: {req.constraints}")
+            target_qed  = req.constraints.qed
+            target_logp = req.constraints.logp
+            target_tpsa = req.constraints.tpsa
+            target_mw   = req.constraints.mw
 
-        # 2. CREATE THE SCIENTIFIC PROMPT
+        # Build scientific prompt
         prompt = make_custom_prompt(
-            qed=target_qed, 
-            logp=target_logp, 
-            tpsa=target_tpsa, 
-            mw=target_mw
+            qed=target_qed, logp=target_logp,
+            tpsa=target_tpsa, mw=target_mw
         )
+        print(f"[api] Prompt: {prompt}")
 
-        print(f"[api] Final Model Prompt: {prompt}")
-
-        # 3. RUN GENERATION
+        # Run generation
         molecules = generate_molecules(
             MODEL, TOKENIZER, REWARD,
             prompt,
@@ -100,42 +107,90 @@ def generate(req: GenerateRequest):
             target_qed  = target_qed,
             target_logp = target_logp,
             target_tpsa = target_tpsa,
-            target_mw   = target_mw
+            target_mw   = target_mw,
         )
 
-        # 4. FINAL VALIDATION
         if not molecules:
             raise HTTPException(
-                status_code=422, 
-                detail="Chemistry error: Model failed to generate a valid structure for these targets."
+                status_code=422,
+                detail="Model could not generate valid molecules for these targets. Try adjusting parameters."
             )
 
         save_results(molecules)
+        
+        # Format the response with 3D data and top matches
+        # Sort molecules by reward score securely
+        molecules.sort(key=lambda x: x.get("reward_score", 0), reverse=True)
+        
+        primary_molecule = molecules[0]
+        # Generate 3D Data for primary
+        td_data = generate_3d_data(primary_molecule["smiles"])
+        
+        primary_response = {
+            "smiles"        : primary_molecule["smiles"],
+            "3d_data"       : td_data,
+            "score"         : primary_molecule.get("reward_score", 0),
+            "qed"           : primary_molecule.get("qed"),
+            "logp"          : primary_molecule.get("logp"),
+            "tpsa"          : primary_molecule.get("tpsa"),
+            "mw"            : primary_molecule.get("mw"),
+            "lipinski"      : primary_molecule.get("lipinski"),
+            "fragment_score": primary_molecule.get("fragment_score"),
+        }
+        
+        # Get up to 5 alternatives
+        alternatives = []
+        for m in molecules[1:6]:
+            alternatives.append({
+                "smiles"        : m["smiles"],
+                "score"         : m.get("reward_score", 0),
+                "qed"           : m.get("qed"),
+                "logp"          : m.get("logp"),
+                "tpsa"          : m.get("tpsa"),
+                "mw"            : m.get("mw"),
+                "lipinski"      : m.get("lipinski"),
+                "fragment_score": m.get("fragment_score"),
+            })
 
         return {
-            "status": "success",
-            "mode": "natural_language" if req.text_prompt else "expert_sliders",
-            "targets": {"qed": target_qed, "mw": target_mw, "logp": target_logp, "tpsa": target_tpsa},
-            "molecules": molecules[:5] 
+            "primary": primary_response,
+            "alternatives": alternatives
         }
 
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        print(f"[SYSTEM ERROR] {e}")
-        raise HTTPException(status_code=500, detail="Internal AI Processing Error")
+        print(f"[api] ERROR: {e}")
+        raise HTTPException(status_code=500, detail="Internal generation error.")
+
 
 @app.get("/results")
 def get_results():
+    """Return last 10 generated molecules from CSV."""
     path = os.path.join(OUTPUTS_DIR, "generated_molecules.csv")
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="No previous results found.")
+        raise HTTPException(status_code=404, detail="No results yet. Call /generate first.")
     df = pd.read_csv(path)
     return {"molecules": df.head(10).to_dict(orient="records")}
 
-# ── Execution ─────────────────────────────────────────────────────────────
+
+class ValidateRequest(BaseModel):
+    smiles: str
+
+@app.post("/validate")
+def validate_smiles_endpoint(req: ValidateRequest):
+    """Validate a SMILES string and return its properties."""
+    from generate import validate_smiles
+    result = validate_smiles(req.smiles)
+    if result is None:
+        raise HTTPException(status_code=422, detail="Invalid or non-drug-like SMILES.")
+    td_data = generate_3d_data(req.smiles)
+    result["3d_data"] = td_data
+    return result
+
 
 if __name__ == "__main__":
     import uvicorn
-    # Listening on Port 8000
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
